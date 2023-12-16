@@ -564,16 +564,73 @@ def train_graph_by_link(mlp, model, graph, optimizer, device, centroids =None, f
 
 
 
-def lamp_gnn_gradient_step(args, pretrain_model,fake_model, wdiscriminator, syn_graphs, subgraphs, MLPs,feature_MLPs,optimizer_wd, optimizer_all,optimizer_feats,epoch, device,file):
-
-    task_losses = []
+def lamp_gnn_gradient_step(args, pretrain_model,fake_model, wdiscriminator, syn_graphs, subgraphs, MLPs,feature_MLPs,optimizer_wd, optimizer_feats,epoch, device,file):
 
     torch.autograd.set_detect_anomaly(True)
+    pretrain_model.train()
+    fake_model.train()
+    fast_weights = OrderedDict(fake_model.named_parameters())  
+    for inner_batch in range(args.inner_train_steps):
+        loss = torch.tensor(0.0).to(device)
+        for index in range(args.syn_graph_num):
+            syn_graph= syn_graphs.syn_graphs[index]
+            mlp = feature_MLPs[index]
+            z = fake_model.encode(mlp(syn_graph.x), syn_graph.edge_index,fast_weights)
+            loss += fake_model.recon_loss(z,syn_graph.edge_index) 
+        #print(loss.item())
+        gradients = torch.autograd.grad(loss, fast_weights.values(),allow_unused=True, create_graph=True)
+        #print(list(zip(fast_weights.keys(), gradients)))
+        fast_weights = OrderedDict(
+            (name, (param - args.inner_lr *  grad) for ((name, param), grad) in zip(fast_weights.items(), gradients)
+        )     
+    Syn_loss = torch.tensor(0.0).to(device)
+    for id,name in enumerate(args.train_dataset):
+        data_graph = subgraphs[name]
+        z_val = fake_model.encode(MLPs[name](data_graph.x), data_graph.edge_index , fast_weights)
+        Syn_loss+=fake_model.recon_loss(z_val, data_graph.edge_index)
 
 
-    # The key codes are avaiable when the paper is published
+    graphs = [subgraphs[name].transformation(MLPs[name]) for name in args.train_dataset]
+    Dis_loss = torch.tensor(0.0).to(device)
+    for index in range(args.syn_graph_num):
+        syn_graph= syn_graphs.syn_graphs[index]
+
+        wdiscriminator_copy = copy.deepcopy(
+                train_wdiscriminator(syn_graph.transformation(feature_MLPs[index]), graphs, wdiscriminator,
+                                     optimizer_wd, batch_d_per_iter=50))
+        for p in wdiscriminator_copy.parameters(): p.requires_grad = False
+        wdiscriminator_copy.to(device)
+        w1s = []
+        for graph in graphs:w1s.append(wdiscriminator_copy(graph.x,graph.edge_index))
+        w1 = torch.vstack(w1s)
+        w0 = wdiscriminator_copy(feature_MLPs[index](syn_graph.x), syn_graph.edge_index)
+        Dis_loss += (torch.mean(w1) - torch.mean(w0))
 
 
+    Link_loss = torch.tensor(0.0).to(device)
+    for index in range(args.syn_graph_num):
+        syn_graph= syn_graphs.syn_graphs[index]
+        mlp = feature_MLPs[index]
+        syn_graph.link_split(0.2,0.2)
+        weights = OrderedDict(pretrain_model.named_parameters())
+        fast_weights =  pretrain_model.encoder.reparameterization(mlp(syn_graph.x), syn_graph.train_edge_index,weights)
+        for inner_batch in range(args.inner_train_steps):
+            z = pretrain_model.encode(mlp(syn_graph.x), syn_graph.train_edge_index,fast_weights)
+            loss = pretrain_model.recon_loss(z,syn_graph.train_edge_index) 
+            gradients = torch.autograd.grad(loss, fast_weights.values(),allow_unused=True, create_graph=True)
+            fast_weights = OrderedDict((name,(param - args.inner_lr * grad) for ((name, param), grad) in zip(fast_weights.items(), gradients))
+        z_val = pretrain_model.encode(mlp(syn_graph.x), syn_graph.test_edge_index , fast_weights)
+        Link_loss+=pretrain_model.recon_loss(z_val, syn_graph.test_edge_index)
 
-    return pretrain_model,task_losses.mean().item()
+
+    loss =  args.beta*Link_loss + args.alpha*Dis_loss + Syn_loss
+    optimizer_feats.zero_grad()
+    pretrain_batch_loss = loss
+    pretrain_batch_loss.backward()
+    optimizer_feats.step()
+    for p in pretrain_model.parameters():
+        p.data.clamp_(-0.1, 0.1)
+
+
+    return pretrain_model,pretrain_batch_loss.item()
 
